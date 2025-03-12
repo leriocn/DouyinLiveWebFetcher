@@ -5,14 +5,70 @@
 # @Time:        2024/1/2 21:51
 # @Author:      bubu
 # @Project:     douyinLiveWebFetcher
+
+import codecs
 import gzip
+import hashlib
 import random
 import re
 import string
+import subprocess
+import urllib.parse
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import requests
 import websocket
+from py_mini_racer import MiniRacer
+
 from protobuf.douyin import *
+
+
+@contextmanager
+def patched_popen_encoding(encoding='utf-8'):
+    original_popen_init = subprocess.Popen.__init__
+    
+    def new_popen_init(self, *args, **kwargs):
+        kwargs['encoding'] = encoding
+        original_popen_init(self, *args, **kwargs)
+    
+    with patch.object(subprocess.Popen, '__init__', new_popen_init):
+        yield
+
+
+def generateSignature(wss, script_file='sign.js'):
+    """
+    出现gbk编码问题则修改 python模块subprocess.py的源码中Popen类的__init__函数参数encoding值为 "utf-8"
+    """
+    params = ("live_id,aid,version_code,webcast_sdk_version,"
+              "room_id,sub_room_id,sub_channel_id,did_rule,"
+              "user_unique_id,device_platform,device_type,ac,"
+              "identity").split(',')
+    wss_params = urllib.parse.urlparse(wss).query.split('&')
+    wss_maps = {i.split('=')[0]: i.split("=")[-1] for i in wss_params}
+    tpl_params = [f"{i}={wss_maps.get(i, '')}" for i in params]
+    param = ','.join(tpl_params)
+    md5 = hashlib.md5()
+    md5.update(param.encode())
+    md5_param = md5.hexdigest()
+    
+    with codecs.open(script_file, 'r', encoding='utf8') as f:
+        script = f.read()
+    
+    ctx = MiniRacer()
+    ctx.eval(script)
+    
+    try:
+        signature = ctx.call("get_sign", md5_param)
+        return signature
+    except Exception as e:
+        print(e)
+    
+    # 以下代码对应js脚本为sign_v0.js
+    # context = execjs.compile(script)
+    # with patched_popen_encoding(encoding='utf-8'):
+    #     ret = context.call('getSign', {'X-MS-STUB': md5_param})
+    # return ret.get('X-Bogus')
 
 
 def generateMsToken(length=107):
@@ -27,25 +83,6 @@ def generateMsToken(length=107):
     for _ in range(length):
         random_str += base_str[random.randint(0, _len)]
     return random_str
-
-
-def generateTtwid():
-    """
-    产生请求头部cookie中的ttwid字段，访问抖音网页版直播间首页可以获取到响应cookie中的ttwid
-    :return: ttwid
-    """
-    url = "https://live.douyin.com/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-    except Exception as err:
-        print("【X】request the live url error: ", err)
-    else:
-        return response.cookies.get('ttwid')
 
 
 class DouyinLiveWebFetcher:
@@ -116,27 +153,55 @@ class DouyinLiveWebFetcher:
             
             return self.__room_id
     
+    def get_room_status(self):
+        """
+        获取直播间开播状态:
+        room_status: 2 直播已结束
+        room_status: 0 直播进行中
+        """
+        url = ('https://live.douyin.com/webcast/room/web/enter/?aid=6383'
+               '&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live'
+               '&cookie_enabled=true&screen_width=1536&screen_height=864&browser_language=zh-CN&browser_platform=Win32'
+               '&browser_name=Edge&browser_version=133.0.0.0'
+               f'&web_rid={self.live_id}'
+               f'&room_id_str={self.room_id}'
+               '&enter_source=&is_need_double_stream=false&insert_task_id=&live_reason='
+               '&msToken=&a_bogus=')
+        resp = requests.get(url, headers={
+            'User-Agent': self.user_agent,
+            'Cookie': f'ttwid={self.ttwid};'
+        })
+        data = resp.json().get('data')
+        if data:
+            room_status = data.get('room_status')
+            user = data.get('user')
+            user_id = user.get('id_str')
+            nickname = user.get('nickname')
+            print(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
+    
     def _connectWebSocket(self):
         """
         连接抖音直播间websocket服务器，请求直播间数据
         """
-        wss = f"wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/?" \
-              f"app_name=douyin_web&version_code=180800&webcast_sdk_version=1.3.0&update_version_code=1.3.0" \
-              f"&compress=gzip" \
-              f"&internal_ext=internal_src:dim|wss_push_room_id:{self.room_id}|wss_push_did:{self.room_id}" \
-              f"|dim_log_id:202302171547011A160A7BAA76660E13ED|fetch_time:1676620021641|seq:1|wss_info:0-1676" \
-              f"620021641-0-0|wrds_kvs:WebcastRoomStatsMessage-1676620020691146024_WebcastRoomRankMessage-167661" \
-              f"9972726895075_AudienceGiftSyncData-1676619980834317696_HighlightContainerSyncData-2&cursor=t-1676" \
-              f"620021641_r-1_d-1_u-1_h-1" \
-              f"&host=https://live.douyin.com&aid=6383&live_id=1" \
-              f"&did_rule=3&debug=false&endpoint=live_pc&support_wrds=1&" \
-              f"im_path=/webcast/im/fetch/&user_unique_id={self.room_id}&" \
-              f"device_platform=web&cookie_enabled=true&screen_width=1440&screen_height=900&browser_language=zh&" \
-              f"browser_platform=MacIntel&browser_name=Mozilla&" \
-              f"browser_version=5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2010_15_7)%20AppleWebKit/537.36%20(KHTML,%20" \
-              f"like%20Gecko)%20Chrome/110.0.0.0%20Safari/537.36&" \
-              f"browser_online=true&tz_name=Asia/Shanghai&identity=audience&" \
-              f"room_id={self.room_id}&heartbeatDuration=0&signature=00000000"
+        wss = ("wss://webcast5-ws-web-hl.douyin.com/webcast/im/push/v2/?app_name=douyin_web"
+               "&version_code=180800&webcast_sdk_version=1.0.14-beta.0"
+               "&update_version_code=1.0.14-beta.0&compress=gzip&device_platform=web&cookie_enabled=true"
+               "&screen_width=1536&screen_height=864&browser_language=zh-CN&browser_platform=Win32"
+               "&browser_name=Mozilla"
+               "&browser_version=5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,"
+               "%20like%20Gecko)%20Chrome/126.0.0.0%20Safari/537.36"
+               "&browser_online=true&tz_name=Asia/Shanghai"
+               "&cursor=d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1"
+               f"&internal_ext=internal_src:dim|wss_push_room_id:{self.room_id}|wss_push_did:7319483754668557238"
+               f"|first_req_ms:1721106114541|fetch_time:1721106114633|seq:1|wss_info:0-1721106114633-0-0|"
+               f"wrds_v:7392094459690748497"
+               f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&endpoint=live_pc&support_wrds=1"
+               f"&user_unique_id=7319483754668557238&im_path=/webcast/im/fetch/&identity=audience"
+               f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={self.room_id}&heartbeatDuration=0")
+        
+        signature = generateSignature(wss)
+        wss += f"&signature={signature}"
+        
         headers = {
             "cookie": f"ttwid={self.ttwid}",
             'user-agent': self.user_agent,
@@ -195,6 +260,7 @@ class DouyinLiveWebFetcher:
                     'WebcastRoomStatsMessage': self._parseRoomStatsMsg,  # 直播间统计信息
                     'WebcastRoomMessage': self._parseRoomMsg,  # 直播间信息
                     'WebcastRoomRankMessage': self._parseRankMsg,  # 直播间排行榜信息
+                    'WebcastRoomStreamAdaptationMessage': self._parseRoomStreamAdaptationMsg,  # 直播间流配置
                 }.get(method)(msg.payload)
             except Exception:
                 pass
@@ -202,11 +268,11 @@ class DouyinLiveWebFetcher:
     def _wsOnError(self, ws, error):
         print("WebSocket error: ", error)
     
-    def _wsOnClose(self, ws):
+    def _wsOnClose(self, ws, *args):
         print("WebSocket connection closed.")
     
     def _parseChatMsg(self, payload):
-        '''聊天消息'''
+        """聊天消息"""
         message = ChatMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
@@ -214,7 +280,7 @@ class DouyinLiveWebFetcher:
         print(f"【聊天msg】[{user_id}]{user_name}: {content}")
     
     def _parseGiftMsg(self, payload):
-        '''礼物消息'''
+        """礼物消息"""
         message = GiftMessage().parse(payload)
         user_name = message.user.nick_name
         gift_name = message.gift.name
@@ -288,3 +354,8 @@ class DouyinLiveWebFetcher:
         if message.status == 3:
             print("直播间已结束")
             self.stop()
+    
+    def _parseRoomStreamAdaptationMsg(self, payload):
+        message = RoomStreamAdaptationMessage().parse(payload)
+        adaptationType = message.adaptation_type
+        print(f'直播间adaptation: {adaptationType}')
